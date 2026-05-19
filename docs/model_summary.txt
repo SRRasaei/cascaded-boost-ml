@@ -1,0 +1,110 @@
+RezaSeek Neural Controller – Model Summary
+==========================================
+
+Overview
+--------
+This document describes the architecture, parameter count, memory usage, and
+inference characteristics of the RezaSeek neural controller designed for a
+dual cascaded boost converter. The model is optimized for deployment on the
+STM32G431RB microcontroller.
+
+Input Features (7)
+------------------
+1. Vin        – Input voltage (V)
+2. Vint       – Intermediate-stage voltage (V)
+3. Iint       – Intermediate-stage current (A)
+4. Vout       – Output voltage (V)
+5. Iout       – Output current (A)
+6. Vref       – Reference voltage (V)
+7. error_Vout – Vout − Vref (V)
+
+Model Architecture
+------------------
+Input(7)
+ → Dense(64, ReLU)
+ → Dense(32, ReLU)
+ → Dense(16, ReLU)
+ → Output_D1 (1 neuron, Sigmoid)
+ → Output_D2 (1 neuron, Sigmoid)
+
+Layer Details
+-------------
+Dense1:
+- Input size: 7
+- Output size: 64
+- Activation: ReLU
+- Parameters:
+    Weights: 7 × 64 = 448
+    Biases: 64
+    Total: 512
+
+Dense2:
+- Input size: 64
+- Output size: 32
+- Activation: ReLU
+- Parameters:
+    Weights: 64 × 32 = 2048
+    Biases: 32
+    Total: 2080
+
+Dense3:
+- Input size: 32
+- Output size: 16
+- Activation: ReLU
+- Parameters:
+    Weights: 32 × 16 = 512
+    Biases: 16
+    Total: 528
+
+Output_D1:
+- Input size: 16
+- Output size: 1
+- Activation: Sigmoid
+- Parameters:
+    Weights: 16 × 1 = 16
+    Biases: 1
+    Total: 17
+
+Output_D2:
+- Input size: 16
+- Output size: 1
+- Activation: Sigmoid
+- Parameters:
+    Weights: 16 × 1 = 16
+    Biases: 1
+    Total: 17
+
+Total Parameters
+----------------
+Total trainable parameters: 3,154  
+Flash footprint (approx): 3,154 × 4 bytes ≈ 12.3 KB  
+RAM usage for inference buffers: ~512 bytes  
+Estimated inference time: ~36 µs @ 170 MHz (FPU enabled)
+
+Normalization
+-------------
+Input normalization uses StandardScaler:
+    x_norm = (x − mean) / std
+
+Output scaling uses MinMaxScaler with physical duty-cycle limits:
+    feature_range = [0.05, 0.92]
+    duty = sigmoid_out × (0.92 − 0.05) + 0.05
+
+Duty-Cycle Limits
+-----------------
+D_MIN = 0.05  
+D_MAX = 0.92
+
+Deployment Notes
+----------------
+- No BatchNormalization layers are used to ensure deterministic C inference.
+- No Dropout layers are used to avoid training-only behavior.
+- All weights and biases are exported directly into the C header
+  `cascaded_model_weights.h`.
+- The inference function `nn_inference()` performs:
+    1. Input normalization
+    2. Forward pass through Dense layers
+    3. Sigmoid output mapping
+    4. Duty-cycle clipping to [0.05, 0.92]
+
+End of Summary
