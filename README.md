@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/SRRasaei/cascaded-boost-ml/main/.github/banner_minimal_tech.svg" alt="RezaSeek Minimal Tech Banner"/>
+  <img src="https://raw.githubusercontent.com/SRRasaei/cascaded-boost-ml/main/.github/banner_minimal_tech.svg" alt="Minimal Tech Banner"/>
 </p>
 <svg width="1200" height="260" viewBox="0 0 1200 260" xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -16,7 +16,7 @@
   <rect width="1200" height="260" fill="url(#grad)" rx="14"/>
 
   <text x="50%" y="45%" fill="white" font-size="48" font-family="Segoe UI, Roboto, sans-serif" text-anchor="middle" letter-spacing="2">
-    RezaSeek Cascaded Boost ML
+    Cascaded Boost ML
   </text>
 
   <text x="50%" y="68%" fill="url(#accent)" font-size="22" font-family="Segoe UI, Roboto, sans-serif" text-anchor="middle" letter-spacing="3">
