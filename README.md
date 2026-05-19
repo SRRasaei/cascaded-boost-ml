@@ -1,7 +1,31 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/SRRasaei/cascaded-boost-ml/main/docs/banner_rezaseek.svg" 
-       alt="RezaSeek Cascaded Boost ML Banner" width="100%">
+  <img src="https://raw.githubusercontent.com/SRRasaei/cascaded-boost-ml/main/.github/banner_minimal_tech.svg" alt="RezaSeek Minimal Tech Banner"/>
 </p>
+<svg width="1200" height="260" viewBox="0 0 1200 260" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0f0f0f"/>
+      <stop offset="100%" stop-color="#1a1a1a"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00e0ff"/>
+      <stop offset="100%" stop-color="#00ffa6"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="260" fill="url(#grad)" rx="14"/>
+
+  <text x="50%" y="45%" fill="white" font-size="48" font-family="Segoe UI, Roboto, sans-serif" text-anchor="middle" letter-spacing="2">
+    RezaSeek Cascaded Boost ML
+  </text>
+
+  <text x="50%" y="68%" fill="url(#accent)" font-size="22" font-family="Segoe UI, Roboto, sans-serif" text-anchor="middle" letter-spacing="3">
+    Minimal Neural Controller for Dual Boost Converter
+  </text>
+
+  <line x1="300" y1="190" x2="900" y2="190" stroke="url(#accent)" stroke-width="1.2" opacity="0.4"/>
+</svg>
+
 
 
 # Cascaded Boost ML  
