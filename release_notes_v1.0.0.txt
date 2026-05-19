@@ -1,0 +1,18 @@
+RezaSeek Cascaded Boost ML – Release v1.0.0
+
+This release includes the complete dataset generation pipeline, training scripts, exported neural network models, and MCU-ready C header for STM32G431RB.
+
+Included Assets:
+- cascaded_boost_dataset_final.csv
+- cascaded_boost_model.tflite
+- cascaded_model_weights.h
+- cascaded_boost_model.h
+
+Highlights:
+- Physics-based dataset generator with steady-state and transient modeling
+- Noise-augmented ADC-like measurement simulation
+- Lightweight neural controller optimized for STM32 (no BN, no Dropout)
+- Exported C header with deterministic inference function
+- TFLite model for validation and cross-platform testing
+
+License: MIT
