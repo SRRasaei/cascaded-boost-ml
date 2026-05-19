@@ -4,7 +4,7 @@
 </p>
 
 
-# RezaSeek Cascaded Boost ML  
+# Cascaded Boost ML  
 Machine‑Learning Controller for a Dual Cascaded Boost Converter (STM32G431RB)
 
 This repository contains the complete pipeline for generating datasets, training neural models, and exporting MCU‑ready C headers for a dual cascaded boost converter.  
