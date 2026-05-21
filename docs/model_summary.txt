@@ -1,4 +1,4 @@
-RezaSeek Neural Controller – Model Summary
+Neural Controller – Model Summary
 ==========================================
 
 Overview
