@@ -1,4 +1,4 @@
-RezaSeek Cascaded Boost ML – Release v1.0.0
+Cascaded Boost ML – Release v1.0.0
 
 This release includes the complete dataset generation pipeline, training scripts, exported neural network models, and MCU-ready C header for STM32G431RB.
 
