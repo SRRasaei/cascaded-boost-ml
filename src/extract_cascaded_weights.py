@@ -1,335 +1,472 @@
 """
-============================================================================
-استخراج وزن‌های مدل RezaSeek برای STM32G431RB - نسخه ۳.۰
+===============================================================================
+Cascaded Boost Converter Dataset Generator — Version 1.0.0
+Author: Seyed Reza Rasaie 
 
-اصلاحات نسبت به نسخه ۲.۰:
-  1. پشتیبانی از مدل بدون BN (معماری ساده‌شده)
-  2. استخراج epsilon واقعی از layer (نه hardcode)
-  3. تأیید خودکار صحت وزن‌ها با numpy forward pass
-  4. تولید کد C کامل‌تر با static_assert برای بررسی اندازه
-  5. بافرهای inference با اندازه دقیق (نه max_layer)
-============================================================================
+Description:
+    Physics-based dataset generator for a dual-stage cascaded boost converter.
+
+    Features:
+      - Iterative, energy-consistent boost stage solver
+      - MOSFET conduction and switching losses
+      - Diode and inductor losses
+      - ADC-like measurement noise on all variables
+      - Extended duty-cycle range [0.05, 0.88] (aligned with firmware limits)
+      - Separate seeds for steady-state and transient samples
+      - Filtering of unreachable Vref values
+      - Basic efficiency statistics in the final report
+
+Output:
+    cascaded_boost_dataset_final.csv
+===============================================================================
 """
 
-import tensorflow as tf
-from tensorflow import keras
 import numpy as np
+import pandas as pd
+from tqdm import tqdm
 
-MODEL_PATH  = 'cascaded_boost_model.h5'
-SCALER_PATH = 'scaler_params_cascaded.npz'
-OUTPUT_FILE = 'cascaded_model_weights.h'
 
-# ============================================================================
-# ۱. بارگذاری
-# ============================================================================
-print("🔄 بارگذاری مدل...")
-model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+# =============================================================================
+# Cascaded Boost Converter Simulator
+# =============================================================================
+class CascadedBoostSimulator:
+    """
+    Physics-based simulator for a dual-stage cascaded boost converter.
+    Includes MOSFET losses, diode losses, inductor losses, and switching losses.
+    """
 
-print("🔄 بارگذاری ضرایب نرمال‌سازی...")
-sc = np.load(SCALER_PATH)
-mean_X   = sc['mean_X']
-scale_X  = sc['scale_X']
-min_y    = sc['min_y']
-max_y    = sc['max_y']
-feat_min = sc['feat_min']   # [0.05, 0.05]
-feat_max = sc['feat_max']   # [0.92, 0.92]
+    def __init__(self):
+        # Stage 1 parameters
+        self.L1 = 100e-6
+        self.C1 = 220e-6
+        self.Rds1 = 0.05
+        self.Vf1 = 0.7
+        self.RL1 = 0.1
 
-print(f"   mean_X  = {mean_X.round(4)}")
-print(f"   scale_X = {scale_X.round(4)}")
-print(f"   feat_range_D1 = [{feat_min[0]}, {feat_max[0]}]")
-print(f"   feat_range_D2 = [{feat_min[1]}, {feat_max[1]}]")
+        # Stage 2 parameters
+        self.L2 = 100e-6
+        self.C2 = 470e-6
+        self.Rds2 = 0.05
+        self.Vf2 = 0.7
+        self.RL2 = 0.1
 
-# ============================================================================
-# ۲. شناسایی لایه‌ها
-# ============================================================================
-print("\n📋 لایه‌های مدل:")
-for layer in model.layers:
-    print(f"   [{type(layer).__name__:<25}]  {layer.name}")
+        # Switching frequency (aligned with hardware)
+        # PSC=169, ARR=333, CLK=170MHz → f_sw ≈ 30 kHz
+        self.f_sw = 30_000
 
-# لایه‌های مشترک Dense (نه خروجی)
-shared_dense = [l for l in model.layers
-                if isinstance(l, keras.layers.Dense) and l.name.startswith('Dense')]
+        # MOSFET switching transition time (t_rise + t_fall) / 2
+        self.t_sw = 20e-9  # 20 ns
 
-# لایه‌های BN (اگر وجود داشتند)
-bn_layers = [l for l in model.layers
-             if isinstance(l, keras.layers.BatchNormalization)]
+    # -------------------------------------------------------------------------
+    def boost_stage(
+        self,
+        Vin: float,
+        D: float,
+        R_load: float,
+        Rds: float,
+        Vf: float,
+        RL: float,
+    ) -> float:
+        """
+        Compute the output voltage of a single boost stage using an iterative,
+        energy-consistent method.
 
-# لایه‌های خروجی
-output_dense = [l for l in model.layers
-                if isinstance(l, keras.layers.Dense) and l.name.startswith('Output')]
+        Compared to naive ideal formulas, this approach:
+          - Uses Iin derived from Iout and duty (Iin = Iout / (1 - D))
+          - Computes input power and subtracts detailed losses
+          - Iterates until Vout converges
 
-all_dense = shared_dense + output_dense
+        Args:
+            Vin (float): Input voltage (V)
+            D (float): Duty cycle [0.05, 0.92]
+            R_load (float): Load resistance (Ohm)
+            Rds (float): MOSFET on-resistance (Ohm)
+            Vf (float): Diode forward voltage (V)
+            RL (float): Inductor series resistance (Ohm)
 
-print(f"\n   Shared Dense : {[l.name for l in shared_dense]}")
-print(f"   BN layers    : {[l.name for l in bn_layers]} {'(موجود نیستند)' if not bn_layers else ''}")
-print(f"   Output Dense : {[l.name for l in output_dense]}")
+        Returns:
+            float: Realistic output voltage after convergence (V)
+        """
+        D = np.clip(D, 0.05, 0.92)
+        Vin = max(Vin, 0.1)
 
-# ============================================================================
-# ۳. تأیید صحت با numpy forward pass
-# ============================================================================
-print("\n🔍 تأیید صحت وزن‌ها...")
+        # Ideal upper bound
+        Vout_ideal = Vin / (1.0 - D)
 
-def numpy_fwd(X_raw, model, mean_X, scale_X, feat_min, feat_max):
-    """Forward pass دقیقاً مثل کد C که تولید خواهد شد"""
-    # نرمال‌سازی ورودی
-    buf = (X_raw - mean_X) / scale_X
+        # Initial guess: assume ~90% efficiency
+        Vout_est = Vout_ideal * 0.90
 
-    # لایه‌های مشترک
-    shared = [l for l in model.layers
-              if isinstance(l, keras.layers.Dense) and l.name.startswith('Dense')]
-    for layer in shared:
-        W, b = layer.get_weights()
-        buf = np.maximum(0.0, buf @ W + b)
+        # Iterative solution (typically converges in 4–5 iterations)
+        for _ in range(8):
+            Iout_est = Vout_est / R_load
 
-    # لایه‌های خروجی
-    out_layers = [l for l in model.layers
-                  if isinstance(l, keras.layers.Dense) and l.name.startswith('Output')]
-    results = []
-    for i, layer in enumerate(out_layers):
-        W, b = layer.get_weights()
-        raw = 1.0 / (1.0 + np.exp(-(buf @ W + b)))
-        # برگشت از scaled به duty
-        d = raw * (feat_max[i] - feat_min[i]) + feat_min[i]
-        d = np.clip(d, 0.05, 0.92)
-        results.append(d.flatten())
-    return results
+            # Input current from energy conservation: Iin = Iout / (1 - D)
+            Iin_avg = Iout_est / (1.0 - D)
 
-# تولید ورودی‌های تصادفی در محدوده واقعی
-np.random.seed(0)
-X_test_raw = np.column_stack([
-    np.random.uniform(10, 30, 50),    # Vin
-    np.random.uniform(30, 120, 50),   # Vint
-    np.random.uniform(0, 5, 50),      # Iint
-    np.random.uniform(40, 180, 50),   # Vout
-    np.random.uniform(0, 5, 50),      # Iout
-    np.random.uniform(48, 180, 50),   # Vref
-    np.random.uniform(-30, 30, 50),   # error_Vout
-])
+            # MOSFET conduction loss: I^2 * Rds * D
+            P_mosfet_cond = (Iin_avg ** 2) * Rds * D
 
-X_test_norm = (X_test_raw - mean_X) / scale_X
-pred_keras  = model.predict(X_test_norm, verbose=0)
-pred_d1_k   = pred_keras[0].flatten()
-pred_d2_k   = pred_keras[1].flatten()
+            # MOSFET switching loss: 0.5 * Vin * Iin * t_sw * f_sw
+            P_mosfet_sw = 0.5 * Vin * Iin_avg * self.t_sw * self.f_sw
 
-pred_np     = numpy_fwd(X_test_raw, model, mean_X, scale_X, feat_min, feat_max)
-pred_d1_np  = pred_np[0]
-pred_d2_np  = pred_np[1]
+            # Diode loss: Vf * Iout
+            P_diode = Vf * Iout_est
 
-# تبدیل Keras به duty
-pred_d1_k_duty = pred_d1_k * (feat_max[0] - feat_min[0]) + feat_min[0]
-pred_d2_k_duty = pred_d2_k * (feat_max[1] - feat_min[1]) + feat_min[1]
+            # Inductor copper loss: I^2 * RL
+            P_inductor = (Iin_avg ** 2) * RL
 
-diff_d1 = np.max(np.abs(pred_d1_k_duty - pred_d1_np))
-diff_d2 = np.max(np.abs(pred_d2_k_duty - pred_d2_np))
-print(f"   حداکثر خطای D1: {diff_d1:.2e}")
-print(f"   حداکثر خطای D2: {diff_d2:.2e}")
+            # Input and output power
+            P_in = Vin * Iin_avg
+            P_loss = P_mosfet_cond + P_mosfet_sw + P_diode + P_inductor
+            P_out = max(P_in - P_loss, 0.0)
 
-if diff_d1 < 1e-5 and diff_d2 < 1e-5:
-    print("   ✅ وزن‌ها صحیح — فایل هدر قابل اطمینان است")
-else:
-    print("   ⚠️  خطای بزرگ! مدل یا scaler را بررسی کنید")
+            # Efficiency
+            efficiency = np.clip(
+                P_out / P_in if P_in > 1e-9 else 0.85,
+                0.65,
+                0.98,
+            )
 
-# ============================================================================
-# ۴. تولید فایل هدر C
-# ============================================================================
-print(f"\n📝 تولید {OUTPUT_FILE}...")
+            Vout_new = Vout_ideal * efficiency
 
-# تشخیص بزرگترین لایه برای بافر
-max_hidden = max(l.get_weights()[0].shape[1] for l in shared_dense) if shared_dense else 1
+            # Convergence check
+            if abs(Vout_new - Vout_est) < 1e-3:
+                break
 
-with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+            Vout_est = Vout_new
 
-    # ---- هدر ----
-    f.write("/*\n")
-    f.write(" * =======================================================================\n")
-    f.write(" * cascaded_model_weights.h\n")
-    f.write(" * وزن‌های کنترلر هوشمند RezaSeek — نسخه ۳.۰\n")
-    f.write(" * تولیدشده توسط extract_cascaded_weights.py\n")
-    f.write(" *\n")
+        return Vout_est
 
-    arch_str = "Input(7)"
-    for l in shared_dense:
-        arch_str += f" -> Dense({l.get_weights()[0].shape[1]},ReLU)"
-    arch_str += " -> [D1(sig), D2(sig)]"
-    f.write(f" * معماری: {arch_str}\n")
+    # -------------------------------------------------------------------------
+    def vout_max(self, Vin: float, D_max: float = 0.88) -> float:
+        """
+        Conservative estimate of maximum achievable output voltage for
+        two cascaded stages. Used to filter unreachable Vref values.
 
-    f.write(f" *\n")
-    total_params = sum(np.prod(w.shape) for l in all_dense for w in l.get_weights())
-    f.write(f" * پارامتر: {total_params:,}   Flash: {total_params*4/1024:.1f} KB   RAM: ~{max_hidden*2*4} B\n")
-    f.write(" * =======================================================================\n")
-    f.write(" */\n\n")
+        Args:
+            Vin (float): Input voltage (V)
+            D_max (float): Maximum duty cycle used for estimation
 
-    f.write("#ifndef CASCADED_MODEL_WEIGHTS_H\n")
-    f.write("#define CASCADED_MODEL_WEIGHTS_H\n\n")
-    f.write("#include <stdint.h>\n")
-    f.write("#include <math.h>\n\n")
+        Returns:
+            float: Maximum achievable output voltage (V)
+        """
+        V1 = Vin / (1.0 - D_max) * 0.88
+        V2 = V1 / (1.0 - D_max) * 0.88
+        return V2
 
-    # ---- ثابت‌های معماری ----
-    f.write("/* ======================================================================\n")
-    f.write(" * ثابت‌های معماری\n")
-    f.write(" * ======================================================================*/\n")
-    f.write("#define NN_INPUT_SIZE       7U\n")
-    f.write("#define NN_OUTPUT_SIZE      2U\n")
-    f.write(f"#define NN_MAX_HIDDEN      {max_hidden}U    /* بزرگترین لایه مخفی — اندازه بافر */\n")
-    f.write("#define D_MIN               0.05f\n")
-    f.write("#define D_MAX               0.92f\n\n")
+    # -------------------------------------------------------------------------
+    def simulate_steady_state(
+        self,
+        Vin: float,
+        D1: float,
+        D2: float,
+        R_load: float,
+    ):
+        """
+        Steady-state simulation of the cascaded boost converter.
 
-    # ---- ضرایب نرمال‌سازی ورودی ----
-    feat_names = ['VIN', 'VINT', 'IINT', 'VOUT', 'IOUT', 'VREF', 'ERR_VOUT']
-    f.write("/* ======================================================================\n")
-    f.write(" * نرمال‌سازی ورودی (StandardScaler)\n")
-    f.write(" * فرمول: x_norm[i] = (x[i] - MEAN[i]) / STD[i]\n")
-    f.write(" * ======================================================================*/\n")
-    f.write("static const float NN_MEAN[NN_INPUT_SIZE] = {\n    ")
-    f.write(",\n    ".join([f"{v:.8f}f  /* {n} */" for v, n in zip(mean_X, feat_names)]))
-    f.write("\n};\n\n")
+        The second stage is seen by the first stage as an equivalent load:
+            R_load_equiv = R_load / (1 - D2)^2
 
-    f.write("static const float NN_STD[NN_INPUT_SIZE] = {\n    ")
-    f.write(",\n    ".join([f"{v:.8f}f  /* {n} */" for v, n in zip(scale_X, feat_names)]))
-    f.write("\n};\n\n")
+        Returns:
+            tuple: (Vint, Vout, Iint, Iout) with ADC-like noise added.
+        """
+        Vin = np.clip(Vin, 5.0, 32.0)
+        D1 = np.clip(D1, 0.05, 0.92)
+        D2 = np.clip(D2, 0.05, 0.92)
 
-    # ---- ضرایب نرمال‌سازی خروجی ----
-    f.write("/* ======================================================================\n")
-    f.write(" * برگشت خروجی به duty cycle (sigmoid_out → duty)\n")
-    f.write(" * فرمول: duty = sigmoid_out * (FEAT_MAX - FEAT_MIN) + FEAT_MIN\n")
-    f.write(" * ======================================================================*/\n")
-    f.write(f"#define NN_D1_FEAT_MIN    {feat_min[0]:.8f}f\n")
-    f.write(f"#define NN_D1_FEAT_MAX    {feat_max[0]:.8f}f\n")
-    f.write(f"#define NN_D2_FEAT_MIN    {feat_min[1]:.8f}f\n")
-    f.write(f"#define NN_D2_FEAT_MAX    {feat_max[1]:.8f}f\n\n")
+        # Equivalent load seen by stage 1
+        denom = (1.0 - D2) ** 2
+        if denom > 0.01:
+            R_load_equiv = R_load / denom
+        else:
+            R_load_equiv = R_load * 100.0
 
-    # ---- وزن‌های Dense ----
-    f.write("/* ======================================================================\n")
-    f.write(" * وزن‌های لایه‌های Dense\n")
-    f.write(" * ترتیب: W[output_neuron][input_neuron]  (row-major)\n")
-    f.write(" * ======================================================================*/\n\n")
+        # Stage 1
+        Vint = self.boost_stage(
+            Vin,
+            D1,
+            max(R_load_equiv, 1.0),
+            self.Rds1,
+            self.Vf1,
+            self.RL1,
+        )
 
-    layer_info_list = []
+        # Stage 2
+        Vout = self.boost_stage(
+            Vint,
+            D2,
+            R_load,
+            self.Rds2,
+            self.Vf2,
+            self.RL2,
+        )
 
-    for layer in all_dense:
-        W, b = layer.get_weights()
-        in_sz, out_sz = W.shape
-        act = layer.activation.__name__
-        vn  = layer.name.lower()
+        # DC currents
+        Iout = Vout / R_load if R_load > 0 else 0.0
+        Iint = Iout / (1.0 - D2 + 1e-6)
 
-        f.write(f"/* {layer.name}  [{in_sz} → {out_sz}]  act={act} */\n")
-        f.write(f"static const float {vn}_W[{out_sz}][{in_sz}] = {{\n")
-        for o in range(out_sz):
-            row = ", ".join([f"{W[i,o]:.8f}f" for i in range(in_sz)])
-            comma = "," if o < out_sz - 1 else ""
-            f.write(f"    {{ {row} }}{comma}\n")
-        f.write("};\n\n")
+        # ADC-like measurement noise
+        # Voltage: ~0.4% relative error + 5 mV offset
+        # Current: ~0.8% relative error + 1 mA offset
+        Vint += np.random.normal(0.0, 0.004 * abs(Vint) + 0.005)
+        Vout += np.random.normal(0.0, 0.004 * abs(Vout) + 0.005)
+        Iint += np.random.normal(0.0, 0.008 * abs(Iint) + 0.001)
+        Iout += np.random.normal(0.0, 0.008 * abs(Iout) + 0.001)
 
-        f.write(f"static const float {vn}_b[{out_sz}] = {{\n    ")
-        f.write(", ".join([f"{v:.8f}f" for v in b]))
-        f.write("\n};\n\n")
+        return Vint, Vout, Iint, Iout
 
-        layer_info_list.append({
-            'name'  : layer.name,
-            'vn'    : vn,
-            'in_sz' : in_sz,
-            'out_sz': out_sz,
-            'act'   : act,
-            'is_out': layer.name.startswith('Output'),
-        })
+    # -------------------------------------------------------------------------
+    def simulate_transient(
+        self,
+        Vin: float,
+        D1: float,
+        D2: float,
+        R_load: float,
+        Vout_prev: float,
+        alpha: float = 0.15,
+    ):
+        """
+        Approximate transient simulation using a first-order response model.
 
-    # ---- تابع inference ----
-    f.write("/* ======================================================================\n")
-    f.write(" * nn_inference — کنترلر هوشمند\n")
-    f.write(" *\n")
-    f.write(" * ورودی‌ها (input[7]):\n")
-    f.write(" *   [0] Vin         ولتاژ ورودی (V)\n")
-    f.write(" *   [1] Vint        ولتاژ میانی (V)\n")
-    f.write(" *   [2] Iint        جریان میانی (A)\n")
-    f.write(" *   [3] Vout        ولتاژ خروجی (V)\n")
-    f.write(" *   [4] Iout        جریان خروجی (A)\n")
-    f.write(" *   [5] Vref        ولتاژ مرجع (V)\n")
-    f.write(" *   [6] error_Vout  = Vout - Vref (V)\n")
-    f.write(" *\n")
-    f.write(" * خروجی‌ها:\n")
-    f.write(" *   *d1_out : دیوتی سایکل مبدل اول  [0.05, 0.92]\n")
-    f.write(" *   *d2_out : دیوتی سایکل مبدل دوم  [0.05, 0.92]\n")
-    f.write(" *\n")
-    f.write(f" * زمان اجرا: ~36 µs @ 170 MHz (با FPU)\n")
-    f.write(f" * RAM مصرفی: {max_hidden*2*4} bytes (buf_a + buf_b)\n")
-    f.write(" * ======================================================================*/\n\n")
+        Args:
+            Vin (float): Input voltage (V)
+            D1 (float): Duty cycle of stage 1
+            D2 (float): Duty cycle of stage 2
+            R_load (float): Load resistance (Ohm)
+            Vout_prev (float): Previous output voltage (V)
+            alpha (float): Convergence factor (0 = slow, 1 = instant)
 
-    f.write("static inline void nn_inference(\n")
-    f.write("        const float input[NN_INPUT_SIZE],\n")
-    f.write("        float *d1_out,\n")
-    f.write("        float *d2_out)\n")
-    f.write("{\n")
-    f.write(f"    float buf_a[NN_MAX_HIDDEN];\n")
-    f.write(f"    float buf_b[NN_MAX_HIDDEN];\n")
-    f.write("    uint32_t i, j;\n\n")
+        Returns:
+            tuple: (Vint_t, Vout_t, Iint_t, Iout_t) with noise added.
+        """
+        Vint_ss, Vout_ss, Iint_ss, _ = self.simulate_steady_state(
+            Vin,
+            D1,
+            D2,
+            R_load,
+        )
 
-    # گام ۱: نرمال‌سازی
-    f.write("    /* ---- گام ۱: نرمال‌سازی ورودی ---------------------------------- */\n")
-    f.write("    for (i = 0U; i < NN_INPUT_SIZE; i++) {\n")
-    f.write("        buf_a[i] = (input[i] - NN_MEAN[i]) / NN_STD[i];\n")
-    f.write("    }\n\n")
+        # First-order response for Vout
+        Vout_t = Vout_prev + alpha * (Vout_ss - Vout_prev)
+        Iout_t = Vout_t / R_load if R_load > 0 else 0.0
 
-    # گام ۲: لایه‌های مشترک
-    f.write("    /* ---- گام ۲: لایه‌های مشترک ------------------------------------ */\n")
-    shared_info = [li for li in layer_info_list if not li['is_out']]
-    for li in shared_info:
-        vn, in_sz, out_sz, act = li['vn'], li['in_sz'], li['out_sz'], li['act']
-        f.write(f"\n    /* {li['name']}  [{in_sz} → {out_sz}] */\n")
-        f.write(f"    for (i = 0U; i < {out_sz}U; i++) {{\n")
-        f.write(f"        buf_b[i] = {vn}_b[i];\n")
-        f.write(f"        for (j = 0U; j < {in_sz}U; j++) {{\n")
-        f.write(f"            buf_b[i] += {vn}_W[i][j] * buf_a[j];\n")
-        f.write(f"        }}\n")
-        if act == 'relu':
-            f.write(f"        if (buf_b[i] < 0.0f) buf_b[i] = 0.0f;  /* ReLU */\n")
-        elif act == 'sigmoid':
-            f.write(f"        buf_b[i] = 1.0f / (1.0f + expf(-buf_b[i]));  /* Sigmoid */\n")
-        f.write(f"    }}\n")
-        f.write(f"    for (i = 0U; i < {out_sz}U; i++) buf_a[i] = buf_b[i];\n")
+        # Vint assumed close to steady-state (faster dynamics)
+        Vint_t = Vint_ss
 
-    # گام ۳: خروجی‌ها
-    f.write("\n    /* ---- گام ۳: خروجی‌های موازی ---------------------------------- */\n")
-    out_info = [li for li in layer_info_list if li['is_out']]
-    out_vars = ['d1_out', 'd2_out']
-    d_mins   = ['NN_D1_FEAT_MIN', 'NN_D2_FEAT_MIN']
-    d_maxs   = ['NN_D1_FEAT_MAX', 'NN_D2_FEAT_MAX']
+        # Intermediate current proportional to transient output current
+        Iint_t = Iout_t / (1.0 - D2 + 1e-6)
 
-    for li, out_var, dmin, dmax in zip(out_info, out_vars, d_mins, d_maxs):
-        vn, in_sz = li['vn'], li['in_sz']
-        f.write(f"\n    /* {li['name']} → {out_var} */\n")
-        f.write(f"    {{\n")
-        f.write(f"        float raw = {vn}_b[0];\n")
-        f.write(f"        for (j = 0U; j < {in_sz}U; j++) {{\n")
-        f.write(f"            raw += {vn}_W[0][j] * buf_a[j];\n")
-        f.write(f"        }}\n")
-        f.write(f"        raw = 1.0f / (1.0f + expf(-raw));           /* Sigmoid */\n")
-        f.write(f"        raw = raw * ({dmax} - {dmin}) + {dmin};  /* برگشت به duty */\n")
-        f.write(f"        if (raw < D_MIN) raw = D_MIN;               /* کلیپ */\n")
-        f.write(f"        if (raw > D_MAX) raw = D_MAX;\n")
-        f.write(f"        *{out_var} = raw;\n")
-        f.write(f"    }}\n")
+        # Noise on all four variables
+        Vint_t += np.random.normal(0.0, 0.004 * abs(Vint_t) + 0.005)
+        Vout_t += np.random.normal(0.0, 0.004 * abs(Vout_t) + 0.005)
+        Iint_t += np.random.normal(0.0, 0.008 * abs(Iint_t) + 0.001)
+        Iout_t += np.random.normal(0.0, 0.008 * abs(Iout_t) + 0.001)
 
-    f.write("}\n\n")
-    f.write("#endif /* CASCADED_MODEL_WEIGHTS_H */\n")
+        return Vint_t, Vout_t, Iint_t, Iout_t
 
-print(f"✅ {OUTPUT_FILE} با موفقیت تولید شد.")
 
-# ============================================================================
-# ۵. آمار نهایی
-# ============================================================================
-total_params = sum(np.prod(w.shape) for l in all_dense for w in l.get_weights())
-print(f"\n{'='*65}")
-print(f"📊 خلاصه فایل هدر:")
-print(f"   لایه‌های Dense   : {len(all_dense)}")
-print(f"   لایه‌های BN      : {len(bn_layers)} (حذف‌شده در v3.0)")
-print(f"   پارامتر کل      : {total_params:,}")
-print(f"   Flash            : {total_params*4/1024:.1f} KB")
-print(f"   RAM inference    : {max_hidden*2*4} bytes")
-print(f"   زمان تخمینی     : ~36 µs @ 170 MHz")
-print(f"{'='*65}")
-print(f"\n📁 {OUTPUT_FILE} را در Core/Inc پروژه Keil کپی کنید.")
-print("   سپس در ai_controller.c اضافه کنید:")
-print('   #include "cascaded_model_weights.h"')
-print("\n   استفاده:")
-print("   float inputs[7] = {Vin, Vint, Iint, Vout, Iout, Vref, Vout-Vref};")
-print("   nn_inference(inputs, &ai_duty1, &ai_duty2);")
+# =============================================================================
+# Dataset Generation
+# =============================================================================
+
+sim = CascadedBoostSimulator()
+
+# Extended parameter ranges
+Vin_range = np.arange(10, 31, 1)  # 10 V to 30 V
+D1_range = np.arange(0.05, 0.89, 0.04)
+D2_range = np.arange(0.05, 0.89, 0.04)
+R_load_range = [20, 30, 50, 100, 200]
+Vref_range = [20, 36, 48, 72, 96, 120, 150, 180]
+
+print("=" * 65)
+print("Cascaded Boost Dataset Generation — Version 1.0.0")
+print(f"Vin range   : {Vin_range[0]} .. {Vin_range[-1]} V  ({len(Vin_range)} values)")
+print(f"D1 range    : {D1_range[0]:.2f} .. {D1_range[-1]:.2f}  ({len(D1_range)} values)")
+print(f"D2 range    : {D2_range[0]:.2f} .. {D2_range[-1]:.2f}  ({len(D2_range)} values)")
+print(f"R_load list : {R_load_range}")
+print(f"Vref list   : {Vref_range}")
+print(f"f_sw        : {sim.f_sw:,} Hz")
+print("=" * 65)
+
+dataset = []
+skipped_ss = 0
+
+# -----------------------------------------------------------------------------
+# Part 1: Steady-State Samples
+# -----------------------------------------------------------------------------
+print("\n[1/2] Generating steady-state samples...")
+
+np.random.seed(42)
+
+for Vin in tqdm(Vin_range, desc="Vin"):
+    vout_max_possible = sim.vout_max(Vin)
+
+    for R_load in R_load_range:
+        for Vref in Vref_range:
+
+            # Filter unreachable Vref values
+            if Vref > vout_max_possible * 0.95:
+                skipped_ss += 1
+                continue
+
+            for D1 in D1_range:
+                for D2 in D2_range:
+                    Vint, Vout, Iint, Iout = sim.simulate_steady_state(
+                        Vin,
+                        D1,
+                        D2,
+                        R_load,
+                    )
+
+                    error_Vout = Vout - Vref
+
+                    dataset.append(
+                        [
+                            float(Vin),
+                            Vint,
+                            Iint,
+                            Vout,
+                            Iout,
+                            float(Vref),
+                            error_Vout,
+                            D1,
+                            D2,
+                        ]
+                    )
+
+n_steady = len(dataset)
+print(f"Steady-state samples      : {n_steady:,}")
+print(f"Filtered (high Vref)      : {skipped_ss:,}")
+
+# -----------------------------------------------------------------------------
+# Part 2: Transient Samples
+# -----------------------------------------------------------------------------
+print("\n[2/2] Generating transient samples...")
+
+np.random.seed(123)
+
+n_transient_target = 20_000
+transient_added = 0
+skipped_trans = 0
+
+for _ in tqdm(range(n_transient_target), desc="Transient"):
+    Vin = np.random.uniform(10.0, 30.0)
+    D1 = np.random.uniform(0.05, 0.88)
+    D2 = np.random.uniform(0.05, 0.88)
+    R_load = float(np.random.choice(R_load_range))
+    Vref = float(np.random.choice(Vref_range))
+
+    # Filter unreachable Vref values
+    if Vref > sim.vout_max(Vin) * 0.95:
+        skipped_trans += 1
+        continue
+
+    # Previous output voltage with random deviation from steady-state
+    _, Vout_ss, _, _ = sim.simulate_steady_state(Vin, D1, D2, R_load)
+    delta = np.random.uniform(-0.40, 0.40) * Vout_ss
+    Vout_prev = max(Vout_ss + delta, 0.5)
+
+    alpha = np.random.uniform(0.05, 0.50)
+
+    Vint, Vout, Iint, Iout = sim.simulate_transient(
+        Vin,
+        D1,
+        D2,
+        R_load,
+        Vout_prev,
+        alpha,
+    )
+
+    error_Vout = Vout - Vref
+
+    dataset.append(
+        [
+            Vin,
+            Vint,
+            Iint,
+            Vout,
+            Iout,
+            Vref,
+            error_Vout,
+            D1,
+            D2,
+        ]
+    )
+    transient_added += 1
+
+print(f"Transient samples added    : {transient_added:,}")
+print(f"Filtered (high Vref)      : {skipped_trans:,}")
+
+# -----------------------------------------------------------------------------
+# Convert to DataFrame, Shuffle, Filter, Save
+# -----------------------------------------------------------------------------
+columns = [
+    "Vin",
+    "Vint",
+    "Iint",
+    "Vout",
+    "Iout",
+    "Vref",
+    "error_Vout",
+    "D1",
+    "D2",
+]
+df = pd.DataFrame(dataset, columns=columns)
+
+# Shuffle with fixed seed
+df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+
+# Remove rows with unrealistic values
+before = len(df)
+df = df[
+    (df["Vout"] > 0.5)
+    & (df["Vint"] > 0.5)
+    & (df["Vout"] < 300)
+    & (df["Vint"] < 300)
+    & (df["D1"] >= 0.04)
+    & (df["D2"] >= 0.04)
+].reset_index(drop=True)
+removed = before - len(df)
+
+if removed > 0:
+    print(f"Removed invalid rows       : {removed}")
+
+output_file = "cascaded_boost_dataset_final.csv"
+df.to_csv(output_file, index=False)
+
+# -----------------------------------------------------------------------------
+# Final Statistics
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 65)
+print("Final Dataset Statistics — Version 1.0.0")
+print("=" * 65)
+print(f"{'Total samples':<22}: {len(df):,}")
+print(f"{'  → steady-state':<22}: {n_steady:,}")
+print(f"{'  → transient':<22}: {transient_added:,}")
+print(f"{'Vin':<22}: [{df['Vin'].min():.1f}, {df['Vin'].max():.1f}] V")
+print(f"{'Vint':<22}: [{df['Vint'].min():.1f}, {df['Vint'].max():.1f}] V")
+print(f"{'Vout':<22}: [{df['Vout'].min():.1f}, {df['Vout'].max():.1f}] V")
+print(f"{'Iout':<22}: [{df['Iout'].min():.3f}, {df['Iout'].max():.3f}] A")
+print(
+    f"{'error_Vout':<22}: "
+    f"[{df['error_Vout'].min():.1f}, {df['error_Vout'].max():.1f}] V"
+)
+print(f"{'D1':<22}: [{df['D1'].min():.3f}, {df['D1'].max():.3f}]")
+print(f"{'D2':<22}: [{df['D2'].min():.3f}, {df['D2'].max():.3f}]")
+
+# Approximate efficiency statistics
+df["P_out"] = df["Vout"] * df["Iout"]
+df["P_in"] = df["Vin"] * (
+    df["Iout"] / (1 - df["D2"].clip(0.05, 0.92))
+)
+df["eta"] = (df["P_out"] / df["P_in"].clip(lower=0.1)).clip(0, 1)
+print(
+    f"{'Efficiency (approx)':<22}: "
+    f"[{df['eta'].quantile(0.05):.3f}, "
+    f"{df['eta'].quantile(0.95):.3f}]  (5th–95th percentile)"
+)
+
+print("-" * 65)
+print(f"Dataset file '{output_file}' saved successfully.")
+print("Next step: run train_closed_loop_model.py (or the appropriate training script).")
