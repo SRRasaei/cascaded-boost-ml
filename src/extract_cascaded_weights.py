@@ -1,7 +1,7 @@
 """
 ===============================================================================
 Cascaded Boost Converter Dataset Generator — Version 1.0.0
-Author: Seyed Reza Rasaie 
+Author: Seyed Reza Rasaei 
 
 Description:
     Physics-based dataset generator for a dual-stage cascaded boost converter.
